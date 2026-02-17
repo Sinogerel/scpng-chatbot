@@ -1,0 +1,6 @@
+streamlit
+langchain
+langchain-groq
+pinecone-client
+groq
+langchain-community
