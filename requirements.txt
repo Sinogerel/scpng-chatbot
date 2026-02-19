@@ -1,6 +1,10 @@
 streamlit
 langchain
-langchain-groq
-pinecone-client
-groq
 langchain-community
+langchain-pinecone
+langchain-groq
+langchain-huggingface
+pinecone
+sentence-transformers
+pypdf
+docx2txt
