@@ -1,92 +1,105 @@
-import streamlit as st
 import os
+import time
+import streamlit as st
+
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
+
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
-from pinecone import Pinecone
 
-# --- UI Setup ---
+from pinecone import Pinecone, ServerlessSpec
+
 st.set_page_config(page_title="AI FAQ Chatbot", layout="centered")
-st.title("📚 Knowledge-Based FAQ Bot")
+st.title("📚 Knowledge‑Based FAQ Bot")
 
-# --- Secrets (For Streamlit Cloud) ---
-# When running locally, replace these or use a .env file
-GROQ_API_KEY = st.sidebar.text_input("Groq API Key", type="password")
-PINECONE_API_KEY = st.sidebar.text_input("Pinecone API Key", type="password")
+st.sidebar.header("🔐 API Keys")
+st.sidebar.caption("Use Streamlit ‘Secrets’ in production. Sidebar is for local testing only.")
+
+# Prefer secrets in production
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or st.sidebar.text_input("Groq API Key", type="password")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY") or st.sidebar.text_input("Pinecone API Key", type="password")
+
 INDEX_NAME = "chatbot-index"
+PINECONE_CLOUD = "aws"
+PINECONE_REGION = "us-east-1"
 
 if not GROQ_API_KEY or not PINECONE_API_KEY:
-    st.info("Please add your API keys in the sidebar to continue.", icon="🗝️")
+    st.info("Add your API keys in the sidebar (local) or via **Secrets** in Streamlit Cloud.", icon="🗝️")
     st.stop()
 
-# --- Initialize Embeddings & LLM ---
-# We use HuggingFace for FREE local embeddings (no OpenAI cost)
+# Embeddings: MiniLM-L6-v2 (384-dim)
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-llm = ChatGroq(api_key=GROQ_API_KEY, model_name="llama3-8b-8192")
 
-# --- File Upload Section ---
-uploaded_file = st.file_uploader("Upload Knowledge (PDF or DOCX)", type=["pdf", "docx"])
+# Groq LLM (fast model)
+llm = ChatGroq(api_key=GROQ_API_KEY, model="llama3-8b-8192", temperature=0)
 
-if uploaded_file is not None:
-    with st.spinner("Processing document..."):
-        # Save file to a temp location
-        temp_path = "temp_doc"
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        # Load data
-        if uploaded_file.name.lower().endswith(".pdf"):
-            loader = PyPDFLoader(temp_path)
-        elif uploaded_file.name.lower().endswith(".docx"):
-            loader = Docx2txtLoader(temp_path)
-        else:
-            st.error("Unsupported file type.")
-            st.stop()
-        
-        data = loader.load()
+# Pinecone client
+pc = Pinecone(api_key=PINECONE_API_KEY)
 
-        # Split text into chunks
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-        docs = text_splitter.split_documents(data)
+# Ensure index exists
+if not pc.has_index(INDEX_NAME):
+    with st.spinner("Creating Pinecone index (one‑time)…"):
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=384,
+            metric="cosine",
+            spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_REGION),
+        )
+        # Wait for readiness
+        for _ in range(60):
+            time.sleep(1)
+            if pc.describe_index(INDEX_NAME).status.get("ready"):
+                break
 
-        # Upload to Pinecone
-        try:
-            vectorstore = PineconeVectorStore.from_documents(
-                docs, 
-                embeddings, 
-                index_name=INDEX_NAME, 
-                pinecone_api_key=PINECONE_API_KEY
-            )
-            st.success("Knowledge Base Updated!")
-        except Exception as e:
-            st.error(f"Error uploading documents to Pinecone: {e}")
+index = pc.Index(INDEX_NAME)
+vectorstore = PineconeVectorStore(index=index, embedding=embeddings)
 
-# --- Chat Section ---
+uploaded_files = st.file_uploader("Upload Knowledge (PDF or DOCX)", type=["pdf", "docx"], accept_multiple_files=True)
+
+if uploaded_files:
+    with st.spinner("Processing & indexing document(s)…"):
+        docs_all = []
+        for file in uploaded_files:
+            tmp_path = f"tmp_{file.name}"
+            with open(tmp_path, "wb") as f:
+                f.write(file.getbuffer())
+
+            if file.name.lower().endswith(".pdf"):
+                loader = PyPDFLoader(tmp_path)
+            else:
+                loader = Docx2txtLoader(tmp_path)
+
+            docs = loader.load()
+            docs_all.extend(docs)
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=120)
+        chunks = text_splitter.split_documents(docs_all)
+
+        vectorstore.add_documents(chunks)
+
+    st.success("✅ Knowledge Base Updated!")
+
 query = st.text_input("Ask a question about your documents:")
 
 if query:
-    try:
-        # Connect to existing index
-        pc = Pinecone(api_key=PINECONE_API_KEY)
-        vectorstore = PineconeVectorStore(
-            index_name=INDEX_NAME, 
-            embedding=embeddings, 
-            pinecone_api_key=PINECONE_API_KEY
-        )
-        
-        # Setup Retrieval Chain
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3})
-        )
-        
-        with st.spinner("Thinking..."):
-            response = qa_chain.invoke(query)
-            st.markdown("### Answer:")
-            st.write(response["result"] if "result" in response else response)
-    except Exception as e:
-        st.error(f"Error retrieving answer: {e}")
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=retriever,
+        return_source_documents=True,
+    )
+
+    with st.spinner("Thinking…"):
+        response = qa_chain.invoke({"query": query})
+
+    st.markdown("### Answer")
+    st.write(response["result"])
+
+    with st.expander("Sources"):
+        for i, d in enumerate(response.get("source_documents", []), 1):
+            st.markdown(f"**{i}.** {d.metadata.get('source','(no source)')}")
